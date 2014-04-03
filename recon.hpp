@@ -22,14 +22,16 @@
 namespace recon {
 
 const std::string SYNTAX = 
-"RECON \"simplified\" extended regular expression syntax:     \n"
+"RECON extended regular expression syntax:                    \n"
 "  regex      ::= union* EOP                                  \n"
 "  union      ::= concat ('|' concat)*                        \n"
 "  concat     ::= repetition+                                 \n"
 "  repetition ::= atom quantifier*                            \n"
 "  quantifier ::= [*+?] | '{' (\\d+ | \\d* ',' \\d* ) '}'     \n"
+"  negation   ::= '!' atom                                    \n"
 "  atom       ::= literal | dot | charclass | '(' union ')'   \n"
-"                 utf8char # optional (--utf8)                \n"
+"               | utf8char # optional (--utf8)                \n"
+"               | negation                                    \n"
 "  charclass  ::= '[' ']'? [^]]* ']'                          \n"
 "  literal    ::= [^*+?[\\]|]                                 \n"
 "  dot        ::= '.' # NOTE: dot matchs also newline('\\n')  \n"
@@ -83,13 +85,14 @@ bool is_valid_utf8_sequence(const unsigned char *s)
 }
 
 class Parser {
+  friend class RECON;
  public:
   enum ExprType {
     kLiteral = 0, kDot, kCharClass, kUTF8,
     kConcat, kUnion,
     kStar, kPlus, kRepetition, kQmark,
     kEOP, kLpar, kRpar, kByteRange, kEpsilon,
-    kBadExpr
+    kNegation, kBadExpr
   };
   struct Expr {
     Expr() { type = kEpsilon; lhs = rhs = 0; }
@@ -115,8 +118,7 @@ class Parser {
   };
   
   Parser(const std::string &, Encoding);
-  Expr* expr_tree() { return _expr_root; }
-  const std::set<Expr*>& all_expr() const { return _all_expr; }
+  Expr* expr_root() { return _expr_root; }
   Expr* expr(std::size_t);
   Expr* new_expr(ExprType, Expr*, Expr*);
   Expr* clone_expr(Expr*);
@@ -145,7 +147,9 @@ class Parser {
   Expr* parse_atom();
   Expr* parse_charclass();
 
+  void copy_expr(Expr *);
   void fill_transition(Expr *);
+  void fill_pos(Expr *);
   void connect(std::set<Expr*>, std::set<Expr*>);
 
   // fields
@@ -158,7 +162,6 @@ class Parser {
   const unsigned char* _regex_end;
   const unsigned char* _regex_ptr;
   std::deque<Expr> _expr_tree;
-  std::set<Expr*> _all_expr;
   Expr* _expr_root;
   std::bitset<256> _cc_table;
   unsigned char _literal;
@@ -169,7 +172,7 @@ class Parser {
 
 Parser::Expr* Parser::expr(std::size_t index)
 {
-  return index < _expr_tree.size() ? &_expr_tree[index] : NULL;
+  return &_expr_tree[index];
 }
 
 void Parser::Expr::init(ExprType t, Expr* lhs_ = NULL, Expr* rhs_ = NULL)
@@ -205,6 +208,7 @@ void Parser::Expr::init(ExprType t, Expr* lhs_ = NULL, Expr* rhs_ = NULL)
       break;
     }
     case kEpsilon: nullable = true; break;
+    case kNegation: break;
     default: throw "can't handle the type";
   }
 }
@@ -234,7 +238,8 @@ void Parser::Expr::dump(std::size_t tab = 0)
       rhs->dump(tab + 1);
       break;
     }
-    case Parser::kStar: case Parser::kPlus: case Parser::kQmark: {
+    case Parser::kStar: case Parser::kPlus: case Parser::kQmark:
+    case Parser::kNegation: {
       std::cout << *this << std::endl;
       lhs->dump(tab + 1);
       break;
@@ -259,7 +264,7 @@ const char* Parser::Expr::type_name()
     "Concat", "Union", 
     "kStar", "kPlus", "kRepetition", "kQmark",
     "kEOP", "kLpar", "kRpar", "kByteRange", "kEpsilon",
-    "kBadExpr"
+    "kNegation", "kBadExpr"
   };
 
   return type_name_[type];
@@ -292,17 +297,10 @@ Parser::Expr* Parser::clone_expr(Expr* orig)
   return clone;
 }
 
-Parser::Parser(const std::string& regex, Encoding enc): _ok(true), _regex(regex), _encoding(enc), _metachar(false)
+Parser::Parser(const std::string& regex, Encoding enc): _ok(false), _regex(regex), _encoding(enc), _metachar(false)
 {
   _regex_begin = _regex_ptr = reinterpret_cast<const unsigned char*>(_regex.data());
   _regex_end = reinterpret_cast<const unsigned char*>(_regex.data()) + _regex.length();
-  try {
-    parse();
-  } catch (const char* error) {
-    _ok = false;
-    _error = "regular expression parse error: ";
-    _error += error;
-  }
 }
 
 Parser::ExprType Parser::consume()
@@ -323,6 +321,7 @@ Parser::ExprType Parser::consume()
     case '*': _token = kStar;  break;
     case '(': _token = kLpar;  break;
     case ')': _token = kRpar;  break;
+    case '!': _token = kNegation; break;
     case '{': consume_char(); _token = consume_repetition(); break;
     case '\\':consume_char(); meta = true; _token = consume_metachar(); break;
     default:
@@ -365,7 +364,7 @@ bool Parser::lex_is_atom()
   switch (lex()) {
     case kLiteral: case kCharClass: case kDot:
     case kByteRange: case kEpsilon: case kLpar:
-    case kUTF8:
+    case kUTF8: case kNegation:
       return true;
     default: return false;
   }
@@ -521,8 +520,6 @@ void Parser::parse()
     Expr* eop = new_expr(kEOP);
     _expr_root = new_expr(kConcat, expr, eop);
   }
-
-  fill_transition(_expr_root);
 }
 
 Parser::Expr* Parser::parse_union()
@@ -638,6 +635,12 @@ Parser::Expr* Parser::parse_atom()
       consume_char();
       break;
     }
+    case kNegation: {
+      consume();
+      e = parse_atom();
+      e = new_expr(kNegation, e);
+      break;
+    }
     case kLpar: {
       consume();
       e = parse_union();
@@ -706,11 +709,60 @@ Parser::Expr* Parser::parse_charclass()
   return cc;
 }
 
+void Parser::fill_pos(Expr *expr)
+{
+  ExprType type = expr->type;
+  Expr* lhs = expr->lhs;
+  Expr* rhs = expr->rhs;
+  bool& nullable = expr->nullable;
+  std::set<Expr*>& first = expr->first;
+  std::set<Expr*>& last = expr->last;
+  first.clear();
+  last.clear();
+
+  switch (type) {
+    case kLiteral: case kCharClass: case kDot: case kEOP: {
+      nullable = false;
+      first.insert(expr);
+      last.insert(expr);
+      break;
+    }
+    case kEpsilon: {
+      nullable = true;
+      first.insert(expr);
+      last.insert(expr);
+      break;
+    }
+    case kConcat: {
+      fill_pos(expr->lhs); fill_pos(expr->rhs);
+      nullable = lhs->nullable && rhs->nullable;
+      if (lhs->nullable) expr->set_union(lhs->first, rhs->first, first);
+      else first = lhs->first;
+      if (rhs->nullable) expr->set_union(lhs->last, rhs->last, last);
+      else last = rhs->last;
+      break;
+    } 
+    case kUnion: {
+      fill_pos(expr->lhs); fill_pos(expr->rhs);
+      nullable = lhs->nullable || rhs->nullable;
+      expr->set_union(lhs->first, rhs->first, first);
+      expr->set_union(lhs->last, rhs->last, last);
+      break;
+    }
+    case kStar: case kPlus: case kQmark: {
+      fill_pos(expr->lhs);
+      nullable = (type == kPlus || type == kEOP) ? lhs->nullable : true;
+      first = lhs->first; last = lhs->last;
+      break;
+    }
+    default: throw "can't handle the type";
+  }
+}
+
 void Parser::fill_transition(Expr *expr)
 {
   switch (expr->type) {
     case kLiteral: case kCharClass: case kDot: case kEOP:
-      _all_expr.insert(expr);
       break;
     case kEpsilon:
       break;
@@ -794,6 +846,7 @@ NFA::State& NFA::new_state()
 }
 
 class DFA {
+  friend class RECON;
  public:
   enum State_t { REJECT = -1, START = 0 };
   typedef std::set<Parser::Expr*> Subset;
@@ -805,16 +858,16 @@ class DFA {
     int operator[](std::size_t i) const { return t[i]; }
     int& operator[](std::size_t i) { return t[i]; }
   };
-  DFA(const std::string&, Encoding, bool, bool, bool);
-  DFA(const NFA&, bool, bool, bool);
+  DFA(): _ignorecase(false), _ok(false) {};
+  DFA(const NFA&, bool, bool);
   bool ok() const { return _ok; }
-  bool factorial() const { return _factorial; }
   bool ignorecase() const { return _ignorecase; }
   const std::string& error() const { return _error; }
   std::size_t size() const { return _states.size(); }
   const State& state(std::size_t i) const { return _states[i]; }
   State& state(std::size_t i) { return _states[i]; }
   bool accept(int state) const { return state != REJECT && _states[state].accept; }
+  bool accept(char c) const { return accept(std::string(1, c)); }
   bool accept(const std::string&) const;
   const State& operator[](std::size_t i) const { return _states[i]; }
   State& operator[](std::size_t i) { return _states[i]; }
@@ -823,7 +876,7 @@ class DFA {
   bool operator==(const DFA&) const;
   friend std::ostream& operator<<(std::ostream& stream, const DFA& dfa);
  private:
-  void construct(Parser::Expr* expr, const Subset& all_expr);
+  void construct(Parser::Expr* expr);
   void construct(const NFA& nfa);
   void fill_transition(Parser::Expr*, std::vector<Subset>&);
   State& new_state();
@@ -831,7 +884,6 @@ class DFA {
 
   //fields
   bool _ok;
-  bool _factorial;
   bool _ignorecase;
   std::string _error;
   std::deque<State> _states;
@@ -923,34 +975,7 @@ std::string& DFA::pretty(unsigned char c, std::string &label)
   return label;
 }
 
-DFA::DFA(const std::string &regex, Encoding enc = ASCII, bool minimizing = true, bool factorial = false, bool ignorecase = false): _ok(true), _factorial(factorial), _ignorecase(ignorecase)
-{
-  Parser p(regex, enc);
-  if (!p.ok()) {
-    _ok = false;
-    _error = p.error();
-    return;
-  }
-
-  try {
-    construct(p.expr_tree(), p.all_expr());
-  } catch (const char* error) {
-    _ok = false;
-    _error = "dfa construct error: ";
-    _error += error;
-    return;
-   }
-
-  try {
-    if (minimizing) minimize();
-  } catch (const char* error) {
-    _ok = false;
-    _error = "dfa minimize error: ";
-    _error += error;
-  }
-}
-
-DFA::DFA(const NFA &nfa, bool minimizing = true, bool factorial = false, bool ignorecase = false)
+DFA::DFA(const NFA &nfa, bool minimizing = true, bool ignorecase = false)
 {
   try {
     construct(nfa);
@@ -959,10 +984,10 @@ DFA::DFA(const NFA &nfa, bool minimizing = true, bool factorial = false, bool ig
     _error = "dfa construct error: ";
     _error += error;
     return;
-   }
+  }
 
   try {
-    if (minimizing) minimize();
+    minimize();
   } catch (const char* error) {
     _ok = false;
     _error = "dfa minimize error: ";
@@ -970,19 +995,14 @@ DFA::DFA(const NFA &nfa, bool minimizing = true, bool factorial = false, bool ig
   }  
 }
 
-void DFA::construct(Parser::Expr* expr_tree, const Subset& all_expr)
+void DFA::construct(Parser::Expr* expr_root)
 {
   int state_num = 0;
   std::vector<Subset> transition(256);
   std::queue<Subset> queue;
   std::map<Subset, int> subset_to_state;
-  if (_factorial) {
-    queue.push(all_expr);
-    subset_to_state[all_expr] = state_num++;
-  } else {
-    queue.push(expr_tree->first);
-    subset_to_state[expr_tree->first] = state_num++;
-  }
+  queue.push(expr_root->first);
+  subset_to_state[expr_root->first] = state_num++;
 
   while (!queue.empty()) {
     bool accept = false;
@@ -990,7 +1010,7 @@ void DFA::construct(Parser::Expr* expr_tree, const Subset& all_expr)
     std::fill(transition.begin(), transition.end(), Subset());
 
     for (Subset::iterator iter = subset.begin(); iter != subset.end(); ++iter) {
-      accept |= _factorial | (*iter)->type == Parser::kEOP;
+      accept |=  ((*iter)->type == Parser::kEOP);
       fill_transition(*iter, transition);
     }
     queue.pop();
@@ -1011,6 +1031,8 @@ void DFA::construct(Parser::Expr* expr_tree, const Subset& all_expr)
       state[c] = subset_to_state[next];
     }
   }
+
+  _ok = true;
 }
 
 void DFA::construct(const NFA& nfa)
@@ -1028,7 +1050,7 @@ void DFA::construct(const NFA& nfa)
     std::fill(transition.begin(), transition.end(), NSubset());
 
     for (NSubset::iterator iter = subset.begin(); iter != subset.end(); ++iter) {
-      accept = nfa.accept(*iter);
+      accept |= nfa.accept(*iter);
       for (int c = 0; c < 256; c++) {
         transition[c].insert(nfa[*iter].t[c].begin(), nfa[*iter].t[c].end());
       }
@@ -1051,6 +1073,8 @@ void DFA::construct(const NFA& nfa)
       state[c] = subset_to_state[next];
     }
   }
+
+  _ok = true;
 }
 
 void DFA::fill_transition(Parser::Expr* expr, std::vector<DFA::Subset>& transition)
@@ -1083,7 +1107,7 @@ void DFA::fill_transition(Parser::Expr* expr, std::vector<DFA::Subset>& transiti
       }
       break;
     }
-    case Parser::kEOP: break;
+    case Parser::kEpsilon: case Parser::kEOP: break;
     default: throw "can't handle the type";
   }
 }
@@ -1202,23 +1226,466 @@ void DFA::complemente()
   }
 }
 
+class Matrix {
+ public:
+  Matrix(std::size_t i = 0): _size(i), m(_size*_size) {}
+  Matrix(std::size_t row, std::size_t col): _size(row), m(_size*_size) {}
+  Matrix(const Matrix &M) { *this = M; }
+  void resize(std::size_t n) { resize(n, n); }
+  void resize(std::size_t row, std::size_t col) { _size = row; m.resize(_size*_size); }
+  friend std::ostream& operator<<(std::ostream& stream, const Matrix& matrix);
+  std::size_t size() const { return _size; }
+  void clear();
+  void init();
+  void swap(Matrix &M) { m.swap(M.m); }
+  const unsigned char& operator()(std::size_t i, std::size_t j) const { return m[i*_size+j]; }
+  unsigned char& operator()(std::size_t i, std::size_t j) { return m[i*_size+j]; }
+  Matrix& operator*=(const Matrix&);
+  bool operator<(const Matrix& mat) const
+  { return m < mat.m; }
+
+ private:
+  std::size_t _size;
+  std::vector<unsigned char> m;
+};
+
+class IdentityMatrix: public Matrix {
+ public:
+  IdentityMatrix(std::size_t n): Matrix(n, n)
+  {
+    for (std::size_t i = 0; i < n; i++) (*this)(i, i) = 1;
+  }
+};
+
+Matrix& Matrix::operator*=(const Matrix &M)
+{
+  Matrix tmp(size(), size());
+  for (std::size_t i = 0; i < size(); i++) {
+    for (std::size_t j = 0; j < size(); j++) {
+      for (std::size_t k = 0; k < size(); k++) {
+        tmp(i, j) += (*this)(i, k) * M(k, j);
+      }
+    }
+  }
+  swap(tmp);
+  return *this;
+}
+
+void Matrix::clear()
+{
+  for (std::size_t i = 0; i < size(); i++) {
+    for (std::size_t j = 0; j < size(); j++) {
+      (*this)(i, j) = 0;
+    }
+  }
+}
+
+void Matrix::init()
+{
+  for (std::size_t i = 0; i < size(); i++) {
+    for (std::size_t j = 0; j < size(); j++) {
+      (*this)(i, j) = i == j ? 1 : 0;
+    }
+  }
+}
+
+std::ostream& operator<<(std::ostream& stream, const Matrix& matrix)
+{
+  for (std::size_t i = 0; i < matrix.size(); i++) {
+    stream << "{";
+    for (std::size_t j = 0; j < matrix.size(); j++) {
+      stream << matrix(i, j);
+      if (j != matrix.size() - 1) stream << ",";
+    }
+    stream << "}";
+    if (i != matrix.size() - 1) stream << ",";
+    stream << std::endl;
+  }
+  return stream;
+}
+
+class SyntacticMonoid {
+ public:
+  typedef unsigned int Element;
+  SyntacticMonoid(): _ok(false) {}
+  bool construct(const DFA&, const std::bitset<256>&);
+  bool ok() const { return _ok; }
+  size_t size() const { return _transitions.size(); }
+  bool accept(std::size_t index) const { return _accept[index]; }
+  bool aperiodic() const;
+  const Element morphism(const std::string&) const;
+  Element& multiply(std::size_t i, std::size_t j)
+  { return _multiplication_table[i*size()+j]; }
+  const Element& multiply(std::size_t i, std::size_t j) const
+  { return _multiplication_table[i*size()+j]; } 
+  Element& operator()(std::size_t i, std::size_t j)
+  { return multiply(i, j); }
+  const Element& operator()(std::size_t i, std::size_t j) const
+  { return multiply(i, j); }
+  friend std::ostream& operator<<(std::ostream& stream, const SyntacticMonoid& monoid);
+  
+ private:
+  std::vector<Element> _multiplication_table;
+  std::vector<bool> _accept;
+  std::bitset<256> _alphabets;
+  DFA _dfa;
+  bool _ok;
+  std::vector<Matrix> _transitions;
+  std::map<Matrix, std::size_t> _transitions_map;
+};
+
+std::ostream& operator<<(std::ostream& stream, const SyntacticMonoid& monoid)
+{
+  static const char* const state_circle = "circle";
+  static const char* const accept_circle = "doublecircle";
+  static const char* const style  = "fillcolor=lightsteelblue1, style=filled, color = navyblue ";
+
+  stream << "digraph Monoid {\n  rankdir=\"LR\"" << std::endl;
+  for (std::size_t i = 0; i < monoid.size(); i++) {
+    stream << "  " << i << " [shape= " << (monoid.accept(i) ? accept_circle : state_circle)
+           << ", " << style << "]" << std::endl;
+  }
+  stream << "  start [shape=point]\n  start -> 0" << std::endl;
+
+  std::string label;
+  for (std::size_t i = 0; i < monoid.size(); i++) {
+    for (std::size_t j = 0; j < monoid.size(); j++) {
+      stream << "  " << i << " -> " << monoid(i, j)
+             << " [label=\"" << j << "\"]" << std::endl;
+    }
+  }
+  stream << "}" << std::endl;
+  
+  return stream;
+}
+
+bool SyntacticMonoid::construct(const DFA& dfa, const std::bitset<256>& alphabets)
+{
+  _dfa = dfa;
+  _alphabets = alphabets;
+  IdentityMatrix ident(dfa.size());
+  _transitions_map[ident] = 0;
+  std::queue<Matrix> queue;
+  queue.push(ident);
+
+  while (!queue.empty()) {
+    Matrix& mat = queue.front();
+    
+    for (std::size_t c = 0; c < 256; c++) {
+      if (!alphabets[c]) continue;
+      Matrix next(dfa.size());
+      for (std::size_t i = 0; i < dfa.size(); i++) {
+        for (std::size_t j = 0; j < dfa.size(); j++) {
+          if (mat(i, j) == 1) {
+            if (dfa[j][c] != DFA::REJECT) {
+              next(i, dfa[j][c]) = 1;
+            }
+          }
+        }
+      }
+      if (_transitions_map.find(next) == _transitions_map.end()) {
+        _transitions_map[next] = _transitions_map.size();
+        queue.push(next);
+      }
+    }
+    queue.pop();
+  }
+
+  _accept.resize(_transitions_map.size());
+  _transitions.resize(_transitions_map.size());
+  _multiplication_table.resize(size()*size());
+  for (std::map<Matrix, std::size_t>::iterator iter1 = _transitions_map.begin();
+       iter1 != _transitions_map.end(); ++iter1) {
+    _transitions[iter1->second] = iter1->first;
+    _accept[iter1->second] = false;
+
+    for (std::size_t i = 0; i < dfa.size(); i++) {
+      if ((iter1->first)(0, i) != 0 && dfa[i].accept) {
+        _accept[iter1->second] = true;
+      }
+    }
+    
+    for (std::map<Matrix, std::size_t>::iterator iter2 = _transitions_map.begin();
+         iter2 != _transitions_map.end(); ++iter2) {
+      Matrix mat = iter1->first;
+      mat *= iter2->first;
+      multiply(iter1->second, iter2->second) = _transitions_map[mat];
+      mat = iter2->first;
+      mat *= iter1->first;
+      multiply(iter2->second, iter1->second) = _transitions_map[mat];
+    }
+  }
+
+  _ok = true;
+  return true;
+}
+
+const SyntacticMonoid::Element SyntacticMonoid::morphism(const std::string& str) const
+{
+  Matrix mat(_dfa.size());
+  for (std::size_t i = 0; i < _dfa.size(); i++) {
+    int state = i;
+    bool t = true;
+    for (std::size_t j = 0; j < str.length(); j++) {
+      if (!_alphabets[static_cast<unsigned char>(str[j])]) {
+        throw "invalid string";
+      }
+      if (state != DFA::REJECT) state = _dfa[state][str[j]];
+    }
+    if (state != DFA::REJECT) mat(i, state) = 1;
+  }
+
+  return _transitions_map.find(mat)->second;
+}
+
+bool SyntacticMonoid::aperiodic() const
+{
+  for (std::size_t i = 0; i < size(); i++) {
+    Element e = i;
+    for (std::size_t j = 0; j < size(); j++) {
+      e = multiply(e, i);
+    }
+    if (e != multiply(e, i)) return false;
+  }
+
+  return true;
+}
+
 class RECON {
  public:
   RECON(const std::string&);
+  bool compile();
+  bool scompile();
   const DFA& dfa() { return _dfa; };
+  const SyntacticMonoid& monoid() { return _monoid; };
+  bool ok() const { return _ok; };
+  const std::string& alphabets() const { return _alphabets; }
+  void alphabets(const std::string& alph) { _alphabets = alph; }
+  const std::string& error() const { return _error; };
   void complemente() { _dfa.complemente(); };
-
+  const std::string& expression(std::string& regex) const
+  { return expression(regex, _dfa); }
+  std::string const expression() const
+  { std::string s; expression(s); return s; };
+  const std::string& starfree_expression(std::string& regex) const;
+  std::string const starfree_expression() const
+  { std::string s; starfree_expression(s); return s; };
+  static std::string charclass(const std::bitset<256>&);
+ private:
+  void normalize(Parser::Expr* expr, Parser& p);
+  void negate(Parser::Expr* expr, Parser& p);
+  const std::string& expression(std::string&, const DFA& d) const;
   //fields
   std::string _regex;
+  std::string _alphabets;
   DFA _dfa;
+  DFA _alphdfa;
+  SyntacticMonoid _monoid;
+  Encoding _enc;
+  bool _minimizing;
+  bool _ok;
+  std::string _error;
 };
 
-RECON::RECON(const std::string &regex): _regex(regex), _dfa(regex)
+RECON::RECON(const std::string &regex): _regex(regex), _alphabets("."), _enc(ASCII),
+                                        _minimizing(true), _ok(false), _error("") {}
+
+bool RECON::compile()
 {
-}
+  try {
+    Parser palph(_alphabets, ASCII);
+    palph.parse();
+    palph.fill_pos(palph._expr_root);
+    palph.fill_transition(palph._expr_root);
+    _alphdfa.construct(palph.expr_root());
+  } catch (const char* error) {
+    _ok = false;
+    _error = "invalid alphabets";
+    return false;
+  }
+
+  Parser p(_regex, _enc);
+  try {
+    p.parse();
+  } catch (const char* error) {
+    _ok = false;
+    _error = "regular expression parsing error: ";
+    _error += error;
+    return false;
+  }
+
+  try {
+    normalize(p._expr_root, p);
+  } catch (const char* error) {
+    _ok = false;
+    _error = "regular expression normalization error: ";
+    _error += error;
+    return false;
+  }
   
+  try {
+    p.fill_pos(p._expr_root);
+    p.fill_transition(p._expr_root);
+  } catch (const char* error) {
+    _ok = false;
+    _error = "regular expression transition error: ";
+    _error += error;
+    return false;
+  }
+  
+  try {
+    _dfa.construct(p.expr_root());
+  } catch (const char* error) {
+    _ok = false;
+    _error = "dfa construction error: ";
+    _error += error;
+    return false;
+   }
+
+  try {
+    if (_minimizing) _dfa.minimize();
+  } catch (const char* error) {
+    _ok = false;
+    _error = "dfa minimization error: ";
+    _error += error;
+    return false;
+  }
+
+  _ok = true;
+  
+  return _ok;
+}
+
+bool RECON::scompile()
+{
+  if (!_dfa.ok() && !compile()) return false;
+  std::bitset<256> alph;
+  for (std::size_t c = 0; c < 256; c++) {
+    if (_alphdfa.accept(static_cast<char>(c))) alph.set(c);
+  }
+  _monoid.construct(_dfa, alph);
+
+  return _monoid.ok();
+}
+
+void RECON::normalize(Parser::Expr* expr, Parser& p)
+{
+  switch (expr->type) {
+    case Parser::kLiteral: case Parser::kCharClass: case Parser::kDot:
+    case Parser::kEOP: case Parser::kEpsilon:
+      break;
+    case Parser::kConcat: case Parser::kUnion: {
+      normalize(expr->lhs, p); normalize(expr->rhs, p);
+      break;
+    }
+    case Parser::kStar: case Parser::kPlus: case Parser::kQmark: {
+      normalize(expr->lhs, p);
+      break;
+    }
+    case Parser::kNegation: {
+      normalize(expr->lhs, p);
+      Parser::Expr* eop = p.new_expr(Parser::kEOP);
+      expr->type = Parser::kConcat;
+      expr->rhs = eop;
+      p.fill_pos(expr);
+      p.fill_transition(expr);
+      DFA d;
+      d.construct(expr);
+      d.complemente();
+      std::string regex;
+      expression(regex, d);
+      Parser negp(regex, _enc);
+      negp.parse();
+      if (negp.expr_root()->type == Parser::kEOP) {
+        expr->init(Parser::kEpsilon);
+      } else {
+        Parser::Expr* nege = p.clone_expr(negp.expr_root()->lhs);
+        expr->init(nege->type, nege->lhs, nege->rhs);
+        switch (nege->type) {
+          case Parser::kLiteral:
+            expr->literal = nege->literal;
+            break;
+          case Parser::kCharClass:
+            expr->cc_table = nege->cc_table;
+            break;
+          default: break;
+        }
+      }
+      break;
+    }
+    default: throw "can't handle the type";
+  }
+
+  return;
+}
+
+const std::string& RECON::expression(std::string& regex, const DFA& d) const
+{
+  typedef std::pair<size_t, size_t> key;
+  std::map<key, std::string> expressions;
+  std::size_t nstates = d.size() + 2;
+  const std::size_t START = d.size(), END = d.size() + 1;
+
+  for (std::size_t i = 0; i < d.size(); i++) {
+    const DFA::State& state = d[i];
+    if (i == DFA::START) expressions[key(START, i)] = "";
+    if (state.accept) expressions[key(i, END)] = "";
+    for (std::size_t c = 0; c < 256; c++) {
+      if (state[c] == DFA::REJECT ||
+          !_alphdfa.accept(static_cast<char>(c))) continue;
+      if (expressions.find(key(i, state[c])) == expressions.end()) {
+        expressions[key(i, state[c])] = c;
+      } else {
+        expressions[key(i, state[c])] += "|";
+        expressions[key(i, state[c])] += c;
+      }
+    }
+  }
+  
+  for (std::size_t i = 0; i < d.size(); i++) {
+    std::string loop = "";
+    if (expressions.find(key(i, i)) != expressions.end()) {
+      loop = "(" + expressions[key(i, i)] + ")*";
+    }
+    for (std::size_t j = i + 1; j < nstates; j++) {
+      if (expressions.find(key(i, j)) == expressions.end()) continue;
+      std::string to = expressions[key(i, j)];
+      if (to.find('|') != std::string::npos) to = "(" + to + ")";
+      for (std::size_t k = i + 1; k < nstates; k++) {
+        if (expressions.find(key(k, i)) == expressions.end()) continue;
+        std::string from = expressions[key(k, i)];
+        if (from.find('|') != std::string::npos) from = "(" + from + ")";
+        if (expressions.find(key(k, j)) != expressions.end()) {
+          if (expressions[key(k, j)] == "") {
+            expressions[key(k, j)] = "(" + from + loop + to + ")?";
+          } else {
+            expressions[key(k, j)] = expressions[key(k, j)] + "|" + from + loop + to;
+          }
+        } else {
+          expressions[key(k, j)] = from + loop + to;
+        }
+      }
+    }
+  }
+
+  regex = expressions[key(START, END)];
+
+  return regex;
+}
+
+const std::string& RECON::starfree_expression(std::string& regex) const
+{
+  if (!_monoid.aperiodic()) {
+    regex = _regex;
+    return regex;
+  }
+  regex = "star free expression here!";
+  return regex;
+}
+
 } // namespace recon
 
 using recon::RECON;
+using recon::SyntacticMonoid;
 
 #endif // RECON_H_
