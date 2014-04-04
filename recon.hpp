@@ -29,9 +29,10 @@ const std::string SYNTAX =
 "  repetition ::= atom quantifier*                            \n"
 "  quantifier ::= [*+?] | '{' (\\d+ | \\d* ',' \\d* ) '}'     \n"
 "  negation   ::= '!' atom                                    \n"
+"  emptyset   ::= '@'                                           "
 "  atom       ::= literal | dot | charclass | '(' union ')'   \n"
 "               | utf8char # optional (--utf8)                \n"
-"               | negation                                    \n"
+"               | negation | emptyset                         \n"
 "  charclass  ::= '[' ']'? [^]]* ']'                          \n"
 "  literal    ::= [^*+?[\\]|]                                 \n"
 "  dot        ::= '.' # NOTE: dot matchs also newline('\\n')  \n"
@@ -92,7 +93,7 @@ class Parser {
     kConcat, kUnion,
     kStar, kPlus, kRepetition, kQmark,
     kEOP, kLpar, kRpar, kByteRange, kEpsilon,
-    kNegation, kBadExpr
+    kNegation, kEmptySet, kBadExpr
   };
   struct Expr {
     Expr() { type = kEpsilon; lhs = rhs = 0; }
@@ -208,6 +209,7 @@ void Parser::Expr::init(ExprType t, Expr* lhs_ = NULL, Expr* rhs_ = NULL)
       break;
     }
     case kEpsilon: nullable = true; break;
+    case kEmptySet: nullable = false; break;
     case kNegation: break;
     default: throw "can't handle the type";
   }
@@ -322,6 +324,7 @@ Parser::ExprType Parser::consume()
     case '(': _token = kLpar;  break;
     case ')': _token = kRpar;  break;
     case '!': _token = kNegation; break;
+    case '@': _token = kEmptySet; break;
     case '{': consume_char(); _token = consume_repetition(); break;
     case '\\':consume_char(); meta = true; _token = consume_metachar(); break;
     default:
@@ -364,7 +367,7 @@ bool Parser::lex_is_atom()
   switch (lex()) {
     case kLiteral: case kCharClass: case kDot:
     case kByteRange: case kEpsilon: case kLpar:
-    case kUTF8: case kNegation:
+    case kUTF8: case kNegation: case kEmptySet:
       return true;
     default: return false;
   }
@@ -639,6 +642,10 @@ Parser::Expr* Parser::parse_atom()
       consume();
       e = parse_atom();
       e = new_expr(kNegation, e);
+      return e;
+    }
+    case kEmptySet: {
+      e = new_expr(kEmptySet);
       break;
     }
     case kLpar: {
@@ -721,7 +728,7 @@ void Parser::fill_pos(Expr *expr)
   last.clear();
 
   switch (type) {
-    case kLiteral: case kCharClass: case kDot: case kEOP: {
+    case kLiteral: case kCharClass: case kDot: case kEmptySet: case kEOP: {
       nullable = false;
       first.insert(expr);
       last.insert(expr);
@@ -762,7 +769,7 @@ void Parser::fill_pos(Expr *expr)
 void Parser::fill_transition(Expr *expr)
 {
   switch (expr->type) {
-    case kLiteral: case kCharClass: case kDot: case kEOP:
+    case kLiteral: case kCharClass: case kDot: case kEOP: case kEmptySet:
       break;
     case kEpsilon:
       break;
@@ -867,7 +874,6 @@ class DFA {
   const State& state(std::size_t i) const { return _states[i]; }
   State& state(std::size_t i) { return _states[i]; }
   bool accept(int state) const { return state != REJECT && _states[state].accept; }
-  bool accept(char c) const { return accept(std::string(1, c)); }
   bool accept(const std::string&) const;
   const State& operator[](std::size_t i) const { return _states[i]; }
   State& operator[](std::size_t i) { return _states[i]; }
@@ -1107,6 +1113,7 @@ void DFA::fill_transition(Parser::Expr* expr, std::vector<DFA::Subset>& transiti
       }
       break;
     }
+    case Parser::kEmptySet: break;
     case Parser::kEpsilon: case Parser::kEOP: break;
     default: throw "can't handle the type";
   }
@@ -1243,6 +1250,8 @@ class Matrix {
   Matrix& operator*=(const Matrix&);
   bool operator<(const Matrix& mat) const
   { return m < mat.m; }
+  bool operator==(const Matrix& mat) const
+  { return m == mat.m; }
 
  private:
   std::size_t _size;
@@ -1307,21 +1316,31 @@ std::ostream& operator<<(std::ostream& stream, const Matrix& matrix)
 class SyntacticMonoid {
  public:
   typedef unsigned int Element;
+  typedef std::set<Element> ElementSet;
   SyntacticMonoid(): _ok(false) {}
+  bool identity(Element e) const { return e == 0; }
   bool construct(const DFA&, const std::bitset<256>&);
   bool ok() const { return _ok; }
   size_t size() const { return _transitions.size(); }
   bool accept(std::size_t index) const { return _accept[index]; }
   bool aperiodic() const;
-  const Element morphism(const std::string&) const;
-  Element& multiply(std::size_t i, std::size_t j)
+  Element morphism(const std::string&) const;
+  Element morphism(unsigned char c) const
+  { return _charmorphism.find(c)->second; }
+  Element operator()(unsigned char c) const { return morphism(c); }
+  Element operator()(const std::string& str) const { return morphism(str); }
+  Element& multiply(Element i, Element j)
   { return _multiplication_table[i*size()+j]; }
-  const Element& multiply(std::size_t i, std::size_t j) const
+  const Element& multiply(Element i, Element j) const
   { return _multiplication_table[i*size()+j]; } 
-  Element& operator()(std::size_t i, std::size_t j)
+  Element& operator()(Element i, Element j)
   { return multiply(i, j); }
-  const Element& operator()(std::size_t i, std::size_t j) const
+  const Element& operator()(Element i, Element j) const
   { return multiply(i, j); }
+  ElementSet operator()() const;
+  ElementSet operator()(const ElementSet&, Element) const;
+  ElementSet operator()(Element, const ElementSet&) const;
+  ElementSet operator()(const ElementSet&, const ElementSet&) const;
   friend std::ostream& operator<<(std::ostream& stream, const SyntacticMonoid& monoid);
   
  private:
@@ -1332,6 +1351,7 @@ class SyntacticMonoid {
   bool _ok;
   std::vector<Matrix> _transitions;
   std::map<Matrix, std::size_t> _transitions_map;
+  std::map<unsigned char, Element> _charmorphism;
 };
 
 std::ostream& operator<<(std::ostream& stream, const SyntacticMonoid& monoid)
@@ -1387,6 +1407,7 @@ bool SyntacticMonoid::construct(const DFA& dfa, const std::bitset<256>& alphabet
         _transitions_map[next] = _transitions_map.size();
         queue.push(next);
       }
+      if (mat == ident) _charmorphism[c] = _transitions_map[next];
     }
     queue.pop();
   }
@@ -1420,7 +1441,43 @@ bool SyntacticMonoid::construct(const DFA& dfa, const std::bitset<256>& alphabet
   return true;
 }
 
-const SyntacticMonoid::Element SyntacticMonoid::morphism(const std::string& str) const
+SyntacticMonoid::ElementSet SyntacticMonoid::operator()() const
+{
+  ElementSet M;
+  for (Element i = 0; i < size(); i++) M.insert(i);
+  return M;
+}
+
+SyntacticMonoid::ElementSet SyntacticMonoid::operator()(const ElementSet& s, Element e) const
+{
+  ElementSet result;
+  for (ElementSet::iterator iter = s.begin(); iter != s.end(); ++iter) {
+    result.insert(multiply(*iter, e));
+  }
+  return result;
+}
+
+SyntacticMonoid::ElementSet SyntacticMonoid::operator()(Element e, const ElementSet& s) const
+{
+  ElementSet result;
+  for (ElementSet::iterator iter = s.begin(); iter != s.end(); ++iter) {
+    result.insert(multiply(e, *iter));
+  }
+  return result;
+}
+
+SyntacticMonoid::ElementSet SyntacticMonoid::operator()(const ElementSet& s1, const ElementSet& s2) const
+{
+  ElementSet result;
+  for (ElementSet::iterator iter1 = s1.begin(); iter1 != s1.end(); ++iter1) {
+    for (ElementSet::iterator iter2 = s2.begin(); iter2 != s2.end(); ++iter2) {
+      result.insert(multiply(*iter1, *iter2));
+    }    
+  }
+  return result;
+}
+
+SyntacticMonoid::Element SyntacticMonoid::morphism(const std::string& str) const
 {
   Matrix mat(_dfa.size());
   for (std::size_t i = 0; i < _dfa.size(); i++) {
@@ -1472,6 +1529,7 @@ class RECON {
   { std::string s; starfree_expression(s); return s; };
   static std::string charclass(const std::bitset<256>&);
  private:
+  std::string const starfree_recursion(SyntacticMonoid::Element e, std::map<SyntacticMonoid::Element, std::string>& memo) const;
   void normalize(Parser::Expr* expr, Parser& p);
   void negate(Parser::Expr* expr, Parser& p);
   const std::string& expression(std::string&, const DFA& d) const;
@@ -1561,7 +1619,7 @@ bool RECON::scompile()
   if (!_dfa.ok() && !compile()) return false;
   std::bitset<256> alph;
   for (std::size_t c = 0; c < 256; c++) {
-    if (_alphdfa.accept(static_cast<char>(c))) alph.set(c);
+    if (_alphdfa.accept(std::string(1,c))) alph.set(c);
   }
   _monoid.construct(_dfa, alph);
 
@@ -1572,7 +1630,7 @@ void RECON::normalize(Parser::Expr* expr, Parser& p)
 {
   switch (expr->type) {
     case Parser::kLiteral: case Parser::kCharClass: case Parser::kDot:
-    case Parser::kEOP: case Parser::kEpsilon:
+    case Parser::kEOP: case Parser::kEpsilon: case Parser::kEmptySet:
       break;
     case Parser::kConcat: case Parser::kUnion: {
       normalize(expr->lhs, p); normalize(expr->rhs, p);
@@ -1632,7 +1690,7 @@ const std::string& RECON::expression(std::string& regex, const DFA& d) const
     if (state.accept) expressions[key(i, END)] = "";
     for (std::size_t c = 0; c < 256; c++) {
       if (state[c] == DFA::REJECT ||
-          !_alphdfa.accept(static_cast<char>(c))) continue;
+          !_alphdfa.accept(std::string(1,c))) continue;
       if (expressions.find(key(i, state[c])) == expressions.end()) {
         expressions[key(i, state[c])] = c;
       } else {
@@ -1668,7 +1726,11 @@ const std::string& RECON::expression(std::string& regex, const DFA& d) const
     }
   }
 
-  regex = expressions[key(START, END)];
+  if (expressions.find(key(START, END)) == expressions.end()) {
+    regex = "@";
+  } else {
+    regex = expressions[key(START, END)];
+  }
 
   return regex;
 }
@@ -1679,8 +1741,165 @@ const std::string& RECON::starfree_expression(std::string& regex) const
     regex = _regex;
     return regex;
   }
-  regex = "star free expression here!";
+
+  regex = "";
+  std::map<SyntacticMonoid::Element, std::string> memo;
+
+  for (SyntacticMonoid::Element e = 0; e < _monoid.size(); e++) {
+    if (_monoid.accept(e)) {
+      if (regex.length() != 0) regex += "|";
+      regex += starfree_recursion(e, memo);
+    }
+  }
+
   return regex;
+}
+
+std::string const RECON::starfree_recursion(SyntacticMonoid::Element m, std::map<SyntacticMonoid::Element, std::string>& memo) const
+{
+  if (memo.find(m) != memo.end()) return memo[m];
+  
+  std::ostringstream regex;
+
+  if (_monoid.identity(m)) {
+    // \phi^{-1}(1) = A* \ A* W A* = !(A* W A*)
+    // where W = { a \in A: \phi(a) != 1 }
+    regex << "!(!@[";
+    for (std::size_t c = 0; c < 256; c++) {
+      if (!_alphdfa.accept(std::string(1,c))) continue;
+      if (!_monoid.identity(_monoid.morphism(c))) regex << std::string(1, c);
+    }
+    regex << "]!@)";
+  } else {    
+    std::ostringstream UA, AV, AWA;
+    // \phi^{-1}(m) = (U A* & A* V) \ A* W A*
+    // where U = { \phi^{-1}(n)a  | n \in M, a \in A,
+    //                              n \phi(a) M = mM but n \notin mM }
+    //       V = { a \phi^{-1}(n) | n \in M, a \in A,
+    //                              M \phi(a) n = Mm but n \notin Mm }
+    //       W = { a \in A | m \notin M \phi(a) M }
+    //         | { a \phi^{-1}(n) b | n \in M, a,b \in A,
+    //                                m \in M \phi(a) n M & M n \phi(b) M
+    //                            but m \notin M \phi(a) n \phi(b) M      }
+
+    const SyntacticMonoid::ElementSet M = _monoid();
+    const SyntacticMonoid::ElementSet Mm = _monoid(M, m);
+    const SyntacticMonoid::ElementSet mM = _monoid(m, M);
+
+    // build U A*
+    // where U = { \phi^{-1}(n)a  | n \in M, a \in A,
+    //                              n \phi(a) M = mM but n \notin mM }
+    std::vector<std::string> tmp;
+    for (SyntacticMonoid::Element n = 0; n < _monoid.size(); n++) {
+      for (std::size_t a = 0; a < 256; a++) {
+        if (!_alphdfa.accept(std::string(1, a))) continue;
+        if (mM.find(n) != mM.end()) continue;
+        SyntacticMonoid::ElementSet naM = _monoid(_monoid(n, _monoid(a)), M);
+        if (naM != mM) continue;
+        tmp.push_back(starfree_recursion(n, memo) + std::string(1, a));
+      }
+    }
+    if (tmp.empty()) {
+      UA << "(@)";
+    } else if (tmp.size() == 1) {
+      UA << "(" << tmp[0] << "!@)";
+    } else {
+      UA << "((";
+      for (std::size_t i = 0; i < tmp.size(); i++) {
+        UA << tmp[i];
+        if (i < tmp.size() - 1) UA << "|";
+      }
+      UA << ")!@)";
+    }
+
+    // build A* V
+    // where V = { a \phi^{-1}(n) | n \in M, a \in A,
+    //                              M \phi(a) n = Mm but n \notin Mm }
+    tmp.clear();
+    for (SyntacticMonoid::Element n = 0; n < _monoid.size(); n++) {
+      for (std::size_t a = 0; a < 256; a++) {
+        if (!_alphdfa.accept(std::string(1, a))) continue;
+        if (Mm.find(n) != Mm.end()) continue;
+        SyntacticMonoid::ElementSet Man = _monoid(M, _monoid(_monoid(a), n));
+        if (Man != Mm) continue;
+        tmp.push_back(std::string(1, a) + starfree_recursion(n, memo));
+      }
+    }
+    if (tmp.empty()) {
+      AV << "(@)";
+    } else if (tmp.size() == 1) {
+      AV << "(!@" << tmp[0] << ")";
+    } else {
+      AV << "(!@(";
+      for (std::size_t i = 0; i < tmp.size(); i++) {
+        AV << tmp[i];
+        if (i < tmp.size() - 1) AV << "|";
+      }
+      AV << "))";
+    }
+
+    // build A* W A*
+    // where W = { a \in A | m \notin M \phi(a) M }
+    //         | { a \phi^{-1}(n) b | n \in M, a,b \in A,
+    //                                m \in M \phi(a) n M & M n \phi(b) M
+    //                            but m \notin M \phi(a) n \phi(b) M      }
+    tmp.clear();
+    std::set<unsigned char> W_;
+    for (std::size_t a = 0; a < 256; a++) {
+      if (!_alphdfa.accept(std::string(1, a))) continue;
+      const SyntacticMonoid::ElementSet MaM = _monoid(M, _monoid(_monoid(a), M));
+      if (MaM.find(m) == MaM.end()) W_.insert(a);
+    }
+    for (std::size_t a = 0; a < 256; a++) {
+      if (!_alphdfa.accept(std::string(1, a))) continue;
+      const SyntacticMonoid::ElementSet Ma = _monoid(M, _monoid(a));
+      for (std::size_t b = 0; b < 256; b++) {
+        if (!_alphdfa.accept(std::string(1, b))) continue;
+        const SyntacticMonoid::ElementSet bM = _monoid(_monoid(b), M);
+        for (SyntacticMonoid::Element n = 0; n < _monoid.size(); n++) {
+          const SyntacticMonoid::ElementSet ManbM
+              = _monoid(Ma, _monoid(n, bM));
+          if (ManbM.find(m) != ManbM.end()) continue;
+          const SyntacticMonoid::ElementSet ManM
+              = _monoid(Ma, _monoid(n, M));
+          const SyntacticMonoid::ElementSet MnbM
+              = _monoid(M, _monoid(n, bM));
+          if (ManM.find(m) != ManM.end() && MnbM.find(m) != MnbM.end()) {
+            tmp.push_back(
+                std::string(1, a)+starfree_recursion(n, memo)+std::string(1, b));
+          }
+        }
+      }
+    }
+    if (W_.empty() && tmp.empty()) {
+      AWA << "(@)";
+    } else {
+      AWA << "(!@(";
+      if (!W_.empty()) {
+        AWA << "[";
+        for (std::set<unsigned char>::iterator iter = W_.begin();
+             iter != W_.end(); ++iter) {
+          AWA << *iter;
+        }
+        AWA << "]";
+        if (!tmp.empty()) AWA << "|";
+      }
+      for (std::size_t i = 0; i < tmp.size(); i++) {
+        AWA << tmp[i];
+        if (i < tmp.size() - 1) AWA << "|";
+      }
+      AWA << ")!@)";
+    }
+    
+    // finally, build \phi^{-1}(m) = (U A* & A* V) \ A* W A*
+    // note that: (A & B) \ C = !(!A | !B | C)
+    regex << "!("
+          <<     "!("<<UA.str()<<")" <<"|"<< "!("<<AV.str()<<")" <<"|"<< AWA.str()
+        <<   ")";
+  }
+
+  memo[m] = regex.str();
+  return memo[m];
 }
 
 } // namespace recon
