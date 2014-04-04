@@ -650,8 +650,12 @@ Parser::Expr* Parser::parse_atom()
     }
     case kLpar: {
       consume();
-      e = parse_union();
-      if (lex() != kRpar) throw "bad parentheses";
+      if (lex() == kRpar) { // () is regarded as epsilon
+        e = new_expr(kEpsilon);
+      } else {
+        e = parse_union();
+        if (lex() != kRpar) throw "bad parentheses";
+      }
       break;
     }
     default: throw "can't handle the type ";
@@ -1516,8 +1520,9 @@ class RECON {
   const DFA& dfa() { return _dfa; };
   const SyntacticMonoid& monoid() { return _monoid; };
   bool ok() const { return _ok; };
-  const std::string& alphabets() const { return _alphabets; }
-  void alphabets(const std::string& alph) { _alphabets = alph; }
+  std::bitset<256> alphabets() const { return _alphabets; }
+  bool alphabets(const std::string&);
+  bool alphabets(unsigned char c) const { return _alphabets[c]; }
   const std::string& error() const { return _error; };
   void complemente() { _dfa.complemente(); };
   const std::string& expression(std::string& regex) const
@@ -1535,9 +1540,8 @@ class RECON {
   const std::string& expression(std::string&, const DFA& d) const;
   //fields
   std::string _regex;
-  std::string _alphabets;
+  std::bitset<256> _alphabets;
   DFA _dfa;
-  DFA _alphdfa;
   SyntacticMonoid _monoid;
   Encoding _enc;
   bool _minimizing;
@@ -1545,23 +1549,34 @@ class RECON {
   std::string _error;
 };
 
-RECON::RECON(const std::string &regex): _regex(regex), _alphabets("."), _enc(ASCII),
-                                        _minimizing(true), _ok(false), _error("") {}
+RECON::RECON(const std::string &regex): _regex(regex), _enc(ASCII),
+                                        _minimizing(true), _ok(false), _error("") { _alphabets.set(); }
 
-bool RECON::compile()
+bool RECON::alphabets(const std::string& alphre)
 {
+  DFA d;
+  _alphabets.reset();
   try {
-    Parser palph(_alphabets, ASCII);
+    Parser palph(alphre, ASCII);
     palph.parse();
     palph.fill_pos(palph._expr_root);
     palph.fill_transition(palph._expr_root);
-    _alphdfa.construct(palph.expr_root());
+    d.construct(palph.expr_root());
   } catch (const char* error) {
     _ok = false;
     _error = "invalid alphabets";
     return false;
   }
 
+  for (std::size_t c = 0; c < 256; c++) {
+    if (d.accept(std::string(1, c))) _alphabets.set(c);
+  }
+
+  return true;
+}
+
+bool RECON::compile()
+{
   Parser p(_regex, _enc);
   try {
     p.parse();
@@ -1617,11 +1632,7 @@ bool RECON::compile()
 bool RECON::scompile()
 {
   if (!_dfa.ok() && !compile()) return false;
-  std::bitset<256> alph;
-  for (std::size_t c = 0; c < 256; c++) {
-    if (_alphdfa.accept(std::string(1,c))) alph.set(c);
-  }
-  _monoid.construct(_dfa, alph);
+  _monoid.construct(_dfa, alphabets());
 
   return _monoid.ok();
 }
@@ -1689,8 +1700,7 @@ const std::string& RECON::expression(std::string& regex, const DFA& d) const
     if (i == DFA::START) expressions[key(START, i)] = "";
     if (state.accept) expressions[key(i, END)] = "";
     for (std::size_t c = 0; c < 256; c++) {
-      if (state[c] == DFA::REJECT ||
-          !_alphdfa.accept(std::string(1,c))) continue;
+      if (state[c] == DFA::REJECT || !alphabets(c)) continue;
       if (expressions.find(key(i, state[c])) == expressions.end()) {
         expressions[key(i, state[c])] = c;
       } else {
@@ -1764,12 +1774,20 @@ std::string const RECON::starfree_recursion(SyntacticMonoid::Element m, std::map
   if (_monoid.identity(m)) {
     // \phi^{-1}(1) = A* \ A* W A* = !(A* W A*)
     // where W = { a \in A: \phi(a) != 1 }
-    regex << "!(!@[";
+    std::bitset<256> W;
     for (std::size_t c = 0; c < 256; c++) {
-      if (!_alphdfa.accept(std::string(1,c))) continue;
-      if (!_monoid.identity(_monoid.morphism(c))) regex << std::string(1, c);
+      if (!alphabets(c)) continue;
+      if (!_monoid.identity(_monoid.morphism(c))) W.set(c);
     }
-    regex << "]!@)";
+    if (W.count() == alphabets().count()) {
+      regex << "()"; // empty string (epsilon) because !(.*..*) = epsilon
+    } else {
+      regex << "[";
+      for (std::size_t c = 0; c < 256; c++) {
+        if (alphabets(c) && !W[c]) regex << c;
+      }
+      regex << "]*";
+    }
   } else {    
     std::ostringstream UA, AV, AWA;
     // \phi^{-1}(m) = (U A* & A* V) \ A* W A*
@@ -1792,7 +1810,7 @@ std::string const RECON::starfree_recursion(SyntacticMonoid::Element m, std::map
     std::vector<std::string> tmp;
     for (SyntacticMonoid::Element n = 0; n < _monoid.size(); n++) {
       for (std::size_t a = 0; a < 256; a++) {
-        if (!_alphdfa.accept(std::string(1, a))) continue;
+        if (!alphabets(a)) continue;
         if (mM.find(n) != mM.end()) continue;
         SyntacticMonoid::ElementSet naM = _monoid(_monoid(n, _monoid(a)), M);
         if (naM != mM) continue;
@@ -1800,16 +1818,16 @@ std::string const RECON::starfree_recursion(SyntacticMonoid::Element m, std::map
       }
     }
     if (tmp.empty()) {
-      UA << "(@)";
+      UA << "@";
     } else if (tmp.size() == 1) {
-      UA << "(" << tmp[0] << "!@)";
+      UA << tmp[0] << "!@";
     } else {
-      UA << "((";
+      UA << "(";
       for (std::size_t i = 0; i < tmp.size(); i++) {
         UA << tmp[i];
         if (i < tmp.size() - 1) UA << "|";
       }
-      UA << ")!@)";
+      UA << ")!@";
     }
 
     // build A* V
@@ -1818,7 +1836,7 @@ std::string const RECON::starfree_recursion(SyntacticMonoid::Element m, std::map
     tmp.clear();
     for (SyntacticMonoid::Element n = 0; n < _monoid.size(); n++) {
       for (std::size_t a = 0; a < 256; a++) {
-        if (!_alphdfa.accept(std::string(1, a))) continue;
+        if (!alphabets(a)) continue;
         if (Mm.find(n) != Mm.end()) continue;
         SyntacticMonoid::ElementSet Man = _monoid(M, _monoid(_monoid(a), n));
         if (Man != Mm) continue;
@@ -1826,16 +1844,16 @@ std::string const RECON::starfree_recursion(SyntacticMonoid::Element m, std::map
       }
     }
     if (tmp.empty()) {
-      AV << "(@)";
+      AV << "@";
     } else if (tmp.size() == 1) {
-      AV << "(!@" << tmp[0] << ")";
+      AV << "!@" << tmp[0];
     } else {
-      AV << "(!@(";
+      AV << "!@(";
       for (std::size_t i = 0; i < tmp.size(); i++) {
         AV << tmp[i];
         if (i < tmp.size() - 1) AV << "|";
       }
-      AV << "))";
+      AV << ")";
     }
 
     // build A* W A*
@@ -1846,15 +1864,15 @@ std::string const RECON::starfree_recursion(SyntacticMonoid::Element m, std::map
     tmp.clear();
     std::set<unsigned char> W_;
     for (std::size_t a = 0; a < 256; a++) {
-      if (!_alphdfa.accept(std::string(1, a))) continue;
+      if (!alphabets(a)) continue;
       const SyntacticMonoid::ElementSet MaM = _monoid(M, _monoid(_monoid(a), M));
       if (MaM.find(m) == MaM.end()) W_.insert(a);
     }
     for (std::size_t a = 0; a < 256; a++) {
-      if (!_alphdfa.accept(std::string(1, a))) continue;
+      if (!alphabets(a)) continue;
       const SyntacticMonoid::ElementSet Ma = _monoid(M, _monoid(a));
       for (std::size_t b = 0; b < 256; b++) {
-        if (!_alphdfa.accept(std::string(1, b))) continue;
+        if (!alphabets(b)) continue;
         const SyntacticMonoid::ElementSet bM = _monoid(_monoid(b), M);
         for (SyntacticMonoid::Element n = 0; n < _monoid.size(); n++) {
           const SyntacticMonoid::ElementSet ManbM
@@ -1872,9 +1890,9 @@ std::string const RECON::starfree_recursion(SyntacticMonoid::Element m, std::map
       }
     }
     if (W_.empty() && tmp.empty()) {
-      AWA << "(@)";
+      AWA << "@";
     } else {
-      AWA << "(!@(";
+      AWA << "!@(";
       if (!W_.empty()) {
         AWA << "[";
         for (std::set<unsigned char>::iterator iter = W_.begin();
@@ -1888,7 +1906,7 @@ std::string const RECON::starfree_recursion(SyntacticMonoid::Element m, std::map
         AWA << tmp[i];
         if (i < tmp.size() - 1) AWA << "|";
       }
-      AWA << ")!@)";
+      AWA << ")!@";
     }
     
     // finally, build \phi^{-1}(m) = (U A* & A* V) \ A* W A*

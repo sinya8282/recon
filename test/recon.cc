@@ -45,7 +45,11 @@ int main(int argc, char* argv[])
   }
 
   RECON r(regex);
-  r.alphabets(FLAGS_alphabets);
+  if (!r.alphabets(FLAGS_alphabets)) {
+    std::cerr << r.error() << std::endl;;
+    return 0;
+  }
+  
   if (FLAGS_dfa || FLAGS_expression)
   {
     r.scompile();
