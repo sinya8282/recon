@@ -527,13 +527,20 @@ void Parser::parse()
 
 Parser::Expr* Parser::parse_union()
 {
-  Expr* e = parse_concat();
+  Expr* e;
+  
+  e = parse_concat();
 
   while (lex() == kUnion) {
     consume();
-    Expr* f = parse_concat();
-    Expr* g = new_expr(kUnion, e, f);
-    e = g;
+    if (lex() == kUnion || lex() == kRpar || lex() == kEOP) {
+      e = new_expr(kQmark, e);
+      if (lex() == kRpar || lex() == kEOP) break;
+    } else {
+      Expr* f = parse_concat();
+      Expr* g = new_expr(kUnion, e, f);
+      e = g;
+    }
   }
 
   return e;
@@ -624,6 +631,12 @@ Parser::Expr* Parser::parse_atom()
     case kEpsilon: {
       e = new_expr(kEpsilon);
       break;
+    }
+    case kUnion: {
+      consume();
+      e = parse_union();
+      e = new_expr(kQmark, e);
+      return e;
     }
     case kUTF8: {
       unsigned char top = _literal;
@@ -1752,12 +1765,12 @@ const std::string& RECON::starfree_expression(std::string& regex) const
     return regex;
   }
 
-  regex = "";
+  regex = "@";
   std::map<SyntacticMonoid::Element, std::string> memo;
 
   for (SyntacticMonoid::Element e = 0; e < _monoid.size(); e++) {
     if (_monoid.accept(e)) {
-      if (regex.length() != 0) regex += "|";
+      regex += "|";
       regex += starfree_recursion(e, memo);
     }
   }
@@ -1780,7 +1793,7 @@ std::string const RECON::starfree_recursion(SyntacticMonoid::Element m, std::map
       if (!_monoid.identity(_monoid.morphism(c))) W.set(c);
     }
     if (W.count() == alphabets().count()) {
-      regex << "()"; // empty string (epsilon) because !(.*..*) = epsilon
+      regex << ""; // empty string (epsilon) because !(.*..*) = epsilon
     } else {
       regex << "[";
       for (std::size_t c = 0; c < 256; c++) {
