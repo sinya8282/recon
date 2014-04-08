@@ -1794,6 +1794,14 @@ std::string const RECON::starfree_recursion(SyntacticMonoid::Element m, std::map
     }
     if (W.count() == alphabets().count()) {
       regex << ""; // empty string (epsilon) because !(.*..*) = epsilon
+    } else if (W.count() == alphabets().count() - 1) {
+      for (std::size_t c = 0; c < 256; c++) {
+        if (alphabets(c) && !W[c]) {
+          regex << c;
+          regex << "*";
+          break;
+        }
+      }
     } else {
       regex << "[";
       for (std::size_t c = 0; c < 256; c++) {
@@ -1907,12 +1915,19 @@ std::string const RECON::starfree_recursion(SyntacticMonoid::Element m, std::map
     } else {
       AWA << "!@(";
       if (!W_.empty()) {
-        AWA << "[";
-        for (std::set<unsigned char>::iterator iter = W_.begin();
-             iter != W_.end(); ++iter) {
-          AWA << *iter;
+        if (W_.size() == 1) {
+          for (std::set<unsigned char>::iterator iter = W_.begin();
+               iter != W_.end(); ++iter) {
+            AWA << *iter;
+          }          
+        } else {
+          AWA << "[";
+          for (std::set<unsigned char>::iterator iter = W_.begin();
+               iter != W_.end(); ++iter) {
+            AWA << *iter;
+          }
+          AWA << "]";
         }
-        AWA << "]";
         if (!tmp.empty()) AWA << "|";
       }
       for (std::size_t i = 0; i < tmp.size(); i++) {

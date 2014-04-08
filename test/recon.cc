@@ -76,7 +76,7 @@ int main(int argc, char* argv[])
         std::cout << r.monoid() << std::endl;
       }
       if (FLAGS_aperiodic) {
-        std::cout << r.monoid().aperiodic() << std::endl;
+        std::cout << (r.monoid().aperiodic() ? "true" : "false") << std::endl;
       }
       if (FLAGS_starfree_expression) {
       std::cout << r.starfree_expression() << std::endl;
