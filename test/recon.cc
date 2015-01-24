@@ -19,7 +19,7 @@ DEFINE_bool(size, false, "print the size of the DFA.");
 DEFINE_bool(expression, false, "");
 DEFINE_bool(starfree_expression, false, "");
 DEFINE_bool(aperiodic, false, "");
-DEFINE_bool(monoid, false, "dump Monoid as a dot language");
+DEFINE_bool(cayleygraph, false, "dump the cayley graph of its monoid as a dot language");
 
 using namespace recon;
 
@@ -66,13 +66,13 @@ int main(int argc, char* argv[])
     }
   }
 
-  if (FLAGS_starfree_expression || FLAGS_aperiodic || FLAGS_monoid) {
+  if (FLAGS_starfree_expression || FLAGS_aperiodic || FLAGS_cayleygraph) {
     r.scompile();
     if (!r.ok()) {
       std::cerr << "error" << std::endl;
       std::cerr << r.error() << std::endl;
     } else {
-      if (FLAGS_monoid) {
+      if (FLAGS_cayleygraph) {
         std::cout << r.monoid() << std::endl;
       }
       if (FLAGS_aperiodic) {

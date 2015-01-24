@@ -1385,10 +1385,16 @@ std::ostream& operator<<(std::ostream& stream, const SyntacticMonoid& monoid)
   stream << "  start [shape=point]\n  start -> 0" << std::endl;
 
   std::string label;
-  for (std::size_t i = 0; i < monoid.size(); i++) {
-    for (std::size_t j = 0; j < monoid.size(); j++) {
-      stream << "  " << i << " -> " << monoid(i, j)
-             << " [label=\"" << j << "\"]" << std::endl;
+    for (SyntacticMonoid::Element m = 0; m < monoid.size(); m++) {
+    for (SyntacticMonoid::Element n = 0; n < monoid.size(); n++) {
+      if (monoid(n, m) != n) {
+        stream << "  " << n << " -> " << monoid(n, m)
+               << " [label=\"" << m << "\", color=blue]" << std::endl;
+      }
+      if (monoid(m,n) != n) {
+        stream << "  " << n << " -> " << monoid(m, n)
+               << " [label=\"" << m << "\", color=red]" << std::endl;
+      }
     }
   }
   stream << "}" << std::endl;
