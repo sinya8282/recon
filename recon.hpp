@@ -1387,13 +1387,18 @@ std::ostream& operator<<(std::ostream& stream, const SyntacticMonoid& monoid)
   std::string label;
     for (SyntacticMonoid::Element m = 0; m < monoid.size(); m++) {
     for (SyntacticMonoid::Element n = 0; n < monoid.size(); n++) {
-      if (monoid(n, m) != n) {
+      if (monoid(n, m) == monoid(m, n) && monoid(n, m) != n) {
+        stream << "  " << n << " -> " << monoid(n, m)
+               << " [label=\"" << m << "\"]" << std::endl;
+      } else {
+        if (monoid(m,n) != n) {
+          stream << "  " << n << " -> " << monoid(m, n)
+                 << " [label=\"" << m << "\", color=red]" << std::endl;
+        }
+        if (monoid(n, m) != n) {
         stream << "  " << n << " -> " << monoid(n, m)
                << " [label=\"" << m << "\", color=blue]" << std::endl;
-      }
-      if (monoid(m,n) != n) {
-        stream << "  " << n << " -> " << monoid(m, n)
-               << " [label=\"" << m << "\", color=red]" << std::endl;
+        }
       }
     }
   }
